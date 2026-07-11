@@ -4,11 +4,13 @@
 
 ### The In-Process Knowledge Graph for AI Agents
 
+> **Agent Zero Edition** · A Hermes port is planned.
+
 **No external databases. No network calls. No infrastructure.**
 
 Mnemograph gives your AI agent a persistent memory layer that thinks in connections — entities, relationships, and contextual recall — running entirely inside the agent process.
 
-[Features](#-why-mnemograph) · [Architecture](#-how-it-works) · [Install](#-installation) · [Config](#-configuration)
+[Features](#-why-mnemograph) · [Architecture](#-how-it-works) · [Install](#-installation) · [Config](#-configuration) · [Roadmap](#-roadmap)
 
 </div>
 
@@ -496,6 +498,17 @@ Features:
 - **SQLite3** — Python standard library
 - **asyncio** — Async I/O concurrency
 - **Agent Zero Framework** — Extension hooks and utility model integration
+
+---
+
+## 🗺️ Roadmap
+
+| Edition | Status | Framework |
+|---------|--------|----------|
+| **Agent Zero** (this repo) | Production-ready | Agent Zero v1.20+ |
+| **Hermes** | Planned | Hermes Agent Framework |
+
+The core architecture — SQLite WAL storage, LRU cache, bounded extraction queue, circuit breaker, PII detection — is framework-agnostic. The Hermes port will adapt the four extension hooks to Hermes's lifecycle events while preserving all safety guarantees and performance budgets.
 
 ---
 

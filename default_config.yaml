@@ -1,0 +1,43 @@
+# ═══════════════════════════════════════════════
+# Graph Memory Plugin Configuration
+# ═══════════════════════════════════════════════
+
+# --- Extraction (monologue_end hook) ---
+extraction_enabled: true
+extraction_min_messages: 3
+extraction_max_entities: 10
+extraction_max_relationships: 15
+extraction_queue_maxsize: 50
+extraction_circuit_breaker_threshold: 3
+extraction_circuit_breaker_reset_minutes: 5
+
+# --- Recall (message_loop_prompts_after hook) ---
+recall_enabled: true
+recall_max_entities: 3
+recall_timeout_ms: 50
+recall_cache_max_size: 2000
+recall_cache_ttl_seconds: 60
+
+# --- Context Injection (system_prompt hook) ---
+context_inject_enabled: true
+context_inject_max_entities: 3
+context_inject_max_lines: 10
+
+# --- Entity Validation ---
+validation_min_length: 2
+validation_max_length: 100
+validation_min_confidence: 0.3
+validation_require_letter: true
+validation_require_proper_noun: true
+
+# --- Write Concurrency ---
+write_semaphore_limit: 2
+
+# --- Rollout Phase ---
+# shadow = extract+recall run, outputs logged not injected
+# read_only = recall feeds context but no prompt injection
+# full = prompt injection enabled
+rollout_phase: full
+
+# --- SQLite ---
+sqlite_busy_timeout: 5000

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+*.log
+.DS_Store

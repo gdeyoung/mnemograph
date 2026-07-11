@@ -1,4 +1,4 @@
-name: _graph_memory
+name: graph_memory
 title: Graph Memory
 description: >
   In-process knowledge graph layer — entity extraction, relationship tracking,

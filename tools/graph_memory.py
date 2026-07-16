@@ -1,6 +1,6 @@
 """
 Graph Memory user-facing tool.
-Provides search, insights, relationships, stats, export, and health check.
+Provides search, insights, relationships, stats, export, health, dream, sync.
 """
 
 import asyncio
@@ -17,13 +17,7 @@ class GraphMemoryTool(Tool):
         Graph memory operations.
 
         Args:
-            action: One of: search, insights, relationships, stats, export, import, health
-            query: Search query (for search/insights)
-            entity_name: Entity name (for relationships)
-            limit: Max results
-            domain: Filter by domain
-            export_dir: Directory for export
-            import_path: JSONL file path for import
+            action: search, insights, relationships, stats, export, import, health, dream, sync_export, sync_import, sync_status
         """
         from usr.plugins._graph_memory.helpers import entity_registry
         from usr.plugins._graph_memory.helpers import graph_db
@@ -31,25 +25,17 @@ class GraphMemoryTool(Tool):
 
         if action == "search":
             if not query:
-                return Response(
-                    message="Error: query is required for search.",
-                    break_loop=False,
-                )
+                return Response(message="Error: query is required for search.", break_loop=False)
             results = await entity_registry.search(
                 query, limit=int(limit),
                 domain=domain if domain else None,
             )
             if not results:
-                return Response(
-                    message=f"No entities found matching '{query}'.",
-                    break_loop=False,
-                )
+                return Response(message=f"No entities found matching '{query}'.", break_loop=False)
             formatted = []
             for r in results:
                 desc = r.get("description", "")
-                line = (
-                    f"**{r['name']}** ({r['type']}/{r['domain']}, conf={r.get('confidence', 0.5):.2f})"
-                )
+                line = f"**{r['name']}** ({r['type']}/{r['domain']}, conf={r.get('confidence', 0.5):.2f})"
                 if desc:
                     line += f"\n  {desc}"
                 formatted.append(line)
@@ -58,17 +44,10 @@ class GraphMemoryTool(Tool):
 
         elif action == "insights":
             if not query:
-                return Response(
-                    message="Error: query is required for insights.",
-                    break_loop=False,
-                )
-            # Get entities + their relationships
+                return Response(message="Error: query is required for insights.", break_loop=False)
             entities = await entity_registry.search(query, limit=int(limit))
             if not entities:
-                return Response(
-                    message=f"No entities found for '{query}'.",
-                    break_loop=False,
-                )
+                return Response(message=f"No entities found for '{query}'.", break_loop=False)
             lines = [f"## Insights for '{query}'"]
             for ent in entities[:5]:
                 lines.append(f"\n### {ent['name']} ({ent['type']}/{ent['domain']})")
@@ -76,8 +55,7 @@ class GraphMemoryTool(Tool):
                 if rels:
                     lines.append("Relationships:")
                     for r in rels:
-                        other = (r["target_name"] if r["source_name"] == ent["name"]
-                                 else r["source_name"])
+                        other = r["target_name"] if r["source_name"] == ent["name"] else r["source_name"]
                         lines.append(f"  - {r['rel_type']}: {other} (conf={r.get('confidence', 0.5):.2f})")
                 else:
                     lines.append("  No relationships found.")
@@ -86,16 +64,10 @@ class GraphMemoryTool(Tool):
 
         elif action == "relationships":
             if not entity_name:
-                return Response(
-                    message="Error: entity_name is required for relationships.",
-                    break_loop=False,
-                )
+                return Response(message="Error: entity_name is required.", break_loop=False)
             rels = await entity_registry.get_relationships(entity_name, limit=int(limit))
             if not rels:
-                return Response(
-                    message=f"No relationships found for '{entity_name}'.",
-                    break_loop=False,
-                )
+                return Response(message=f"No relationships found for '{entity_name}'.", break_loop=False)
             formatted = []
             for r in rels:
                 formatted.append(
@@ -137,10 +109,7 @@ class GraphMemoryTool(Tool):
 
         elif action == "import":
             if not import_path:
-                return Response(
-                    message="Error: import_path is required for import.",
-                    break_loop=False,
-                )
+                return Response(message="Error: import_path is required.", break_loop=False)
             result = await graph_lifecycle.graph_import(import_path, mode="merge")
             if "error" in result:
                 return Response(message=f"Import failed: {result['error']}", break_loop=False)
@@ -176,7 +145,70 @@ class GraphMemoryTool(Tool):
                     lines.append(f"- Orphans removed: {cleanup.get('orphans_removed', 0)}")
                     lines.append(f"- Invalid entities removed: {cleanup.get('invalid_entities_removed', 0)}")
                     lines.append(f"- VACUUM: {'✅' if cleanup.get('vacuumed') else '⚠️ skipped'}")
-                    lines.append(f"- Pre-cleanup backup: `{cleanup.get('backup_path', 'N/A')}`")
+            text = "\n".join(lines)
+            return Response(message=text, break_loop=False)
+
+        elif action == "dream":
+            from usr.plugins._graph_memory.helpers.dreaming import run_dream_cycle
+            from helpers import plugins as plugins_mod
+            config = plugins_mod.get_plugin_config("_graph_memory", self.agent) or {}
+            config.setdefault("dreaming_passes", {})
+            config["dreaming_passes"].setdefault("decay", True)
+            config["dreaming_passes"].setdefault("dedup", True)
+            config["dreaming_passes"].setdefault("prune", True)
+            config["dreaming_passes"].setdefault("infer", True)
+            config["dreaming_passes"].setdefault("strengthen", True)
+            config["dreaming_passes"].setdefault("link", False)
+            config["dreaming_passes"].setdefault("checkpoint", True)
+            results = await run_dream_cycle(config)
+            lines = ["## 🌙 Dreaming Cycle Complete"]
+            for pass_name, result in results.items():
+                if result.get("skipped"):
+                    lines.append(f"- **{pass_name}**: skipped")
+                elif result.get("error"):
+                    lines.append(f"- **{pass_name}**: ❌ {result['error']}")
+                else:
+                    summary = ", ".join(f"{k}={v}" for k, v in result.items())
+                    lines.append(f"- **{pass_name}**: {summary}")
+            text = "\n".join(lines)
+            return Response(message=text, break_loop=False)
+
+        elif action == "sync_export":
+            from usr.plugins._graph_memory.helpers.graph_sync import export_to_shared
+            result = await export_to_shared()
+            if "error" in result:
+                return Response(message=f"Sync export failed: {result['error']}", break_loop=False)
+            text = (
+                f"Graph exported to shared drive.\n"
+                f"- File: `{result['filepath']}`\n"
+                f"- Entities: {result['entities']}\n"
+                f"- Relationships: {result['relationships']}"
+            )
+            return Response(message=text, break_loop=False)
+
+        elif action == "sync_import":
+            from usr.plugins._graph_memory.helpers.graph_sync import merge_from_shared
+            result = await merge_from_shared()
+            if "error" in result:
+                return Response(message=f"Sync import failed: {result['error']}", break_loop=False)
+            text = (
+                f"Global graph merged.\n"
+                f"- Imported entities: {result['imported_entities']}\n"
+                f"- Imported relationships: {result['imported_relationships']}"
+            )
+            return Response(message=text, break_loop=False)
+
+        elif action == "sync_status":
+            from usr.plugins._graph_memory.helpers.graph_sync import sync_status
+            result = await sync_status()
+            lines = ["## Graph Sync Status"]
+            lines.append(f"- Directory: `{result['sync_dir']}`")
+            if result.get("files"):
+                lines.append("\n### Files")
+                for f in result["files"]:
+                    lines.append(f"  - {f['name']} ({f['size_bytes']} bytes, modified {f['modified']})")
+            else:
+                lines.append("No sync files found.")
             text = "\n".join(lines)
             return Response(message=text, break_loop=False)
 
@@ -184,7 +216,8 @@ class GraphMemoryTool(Tool):
             return Response(
                 message=(
                     "Unknown action. Available: search, insights, relationships, "
-                    "stats, export, import, health"
+                    "stats, export, import, health, dream, "
+                    "sync_export, sync_import, sync_status"
                 ),
                 break_loop=False,
             )

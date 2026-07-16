@@ -1,6 +1,5 @@
 """
 LLM-based entity and relationship extraction from conversation text.
-Uses the utility model for extraction, with strict JSON output parsing.
 """
 
 import json
@@ -12,6 +11,7 @@ from usr.plugins._graph_memory.helpers.entity_validator import (
     validate_entity_name,
     detect_pii,
     is_valid_entity,
+    validate_entity_type,
     VALID_ENTITY_TYPES,
     VALID_DOMAINS,
     VALID_REL_TYPES,
@@ -27,7 +27,7 @@ SYSTEM_PROMPT = """You are an entity extraction engine. Extract named entities a
 Output ONLY valid JSON with this exact structure:
 {
   "entities": [
-    {"name": "Docker", "type": "technology", "domain": "platform", "description": "Container platform", "confidence": 0.9}
+    {"name": "Docker", "type": "technology", "domain": "platform", "description": "Container platform", "confidence": 0.9, "aliases": ["docker.io"]}
   ],
   "relationships": [
     {"source": "Docker", "target": "Ollama", "type": "runs_on", "confidence": 0.8}
@@ -42,7 +42,9 @@ Rules:
 - Do NOT extract: filenames, file paths, URLs, code snippets, environment variables, numbers, API endpoints
 - Do NOT extract generic words ("the", "system", "server") unless they are a proper noun
 - Confidence: 0.9 = explicitly named, 0.7 = clearly referenced, 0.5 = mentioned in passing
-- Maximum 10 entities and 15 relationships per extraction"""
+- Aliases: include acronyms, common abbreviations, alternate names (e.g. "K8s" for "Kubernetes")
+- Maximum 10 entities and 15 relationships per extraction
+"""
 
 
 def _build_message(conversation_text: str) -> str:
@@ -51,9 +53,7 @@ def _build_message(conversation_text: str) -> str:
 
 
 def _safe_parse_json(raw: str) -> dict:
-    """Parse JSON response with fallback handling."""
     raw = raw.strip()
-    # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
     if raw.endswith("```"):
@@ -61,13 +61,11 @@ def _safe_parse_json(raw: str) -> dict:
     raw = raw.strip()
     if raw.startswith("json"):
         raw = raw[4:].strip()
-
     try:
         result = json.loads(raw)
         result["_parse_ok"] = True
         return result
     except json.JSONDecodeError:
-        # Try DirtyJson-style parsing for partial JSON
         try:
             from helpers.json import DirtyJson
             result = DirtyJson.parse_string(raw)
@@ -80,10 +78,6 @@ def _safe_parse_json(raw: str) -> dict:
 
 
 async def extract_and_store(agent, conversation_text: str, session_id: str = "") -> dict:
-    """
-    Extract entities + relationships via utility model, validate, and store.
-    Returns summary of what was extracted.
-    """
     if not conversation_text or len(conversation_text) < 50:
         return {"entities": 0, "relationships": 0, "skipped": True}
 
@@ -99,14 +93,11 @@ async def extract_and_store(agent, conversation_text: str, session_id: str = "")
 
     parsed = _safe_parse_json(response)
     parse_ok = parsed.get("_parse_ok", False)
-    if not parse_ok:
-        log.warning(f"JSON parse failed. Raw response (first 200 chars): {response[:200]}")
     raw_entities = parsed.get("entities", [])
     raw_rels = parsed.get("relationships", [])
 
-    # ── Validate and store entities ──
     stored_entities = 0
-    entity_name_map = {}  # name -> entity_id for relationship linking
+    entity_name_map = {}
 
     for ent in raw_entities:
         if not isinstance(ent, dict):
@@ -114,38 +105,35 @@ async def extract_and_store(agent, conversation_text: str, session_id: str = "")
         raw_name = ent.get("name", "")
         if not raw_name:
             continue
-
         normed = normalize_name(raw_name)
         valid, reason = validate_entity_name(normed)
         if not valid:
-            log.debug(f"Rejected entity '{normed}': {reason}")
             continue
         if detect_pii(normed):
-            log.debug(f"Rejected entity '{normed}': PII detected")
             continue
-
         etype = ent.get("type", "concept")
         if etype not in VALID_ENTITY_TYPES:
             etype = "concept"
+        # Type validation (Rec #10)
+        etype, corrected = validate_entity_type(normed, etype)
+        if corrected:
+            log.debug(f"Type corrected for '{normed}': {ent.get('type')} -> {etype}")
         domain = ent.get("domain", "general")
         if domain not in VALID_DOMAINS:
             domain = "general"
         confidence = float(ent.get("confidence", 0.5))
         confidence = max(0.1, min(1.0, confidence))
+        aliases = ent.get("aliases", [])
 
         eid = await entity_registry.create_or_update_entity(
-            name=normed,
-            etype=etype,
-            domain=domain,
+            name=normed, etype=etype, domain=domain,
             description=ent.get("description", ""),
-            session_id=session_id,
-            confidence=confidence,
+            aliases=aliases, session_id=session_id, confidence=confidence,
         )
         if eid:
             stored_entities += 1
             entity_name_map[normed] = eid
 
-    # ── Validate and store relationships ──
     stored_rels = 0
     for rel in raw_rels:
         if not isinstance(rel, dict):
@@ -153,17 +141,14 @@ async def extract_and_store(agent, conversation_text: str, session_id: str = "")
         source = normalize_name(rel.get("source", ""))
         target = normalize_name(rel.get("target", ""))
         rel_type = rel.get("type", "related_to")
-
         if not source or not target:
             continue
         if rel_type not in VALID_REL_TYPES:
             rel_type = "related_to"
         if detect_pii(source) or detect_pii(target):
             continue
-
         confidence = float(rel.get("confidence", 0.5))
         confidence = max(0.1, min(1.0, confidence))
-
         await asyncio.to_thread(
             graph_db.upsert_relationship,
             source, target, rel_type, confidence, session_id,

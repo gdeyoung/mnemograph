@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════
-# Graph Memory Plugin Configuration
+# Graph Memory Plugin Configuration v2.0.0
 # ═══════════════════════════════════════════════
 
 # --- Extraction (monologue_end hook) ---
@@ -10,6 +10,9 @@ extraction_max_relationships: 15
 extraction_queue_maxsize: 50
 extraction_circuit_breaker_threshold: 3
 extraction_circuit_breaker_reset_minutes: 5
+
+# --- Session-Aware Re-Extraction (Phase 5) ---
+session_aware_extraction: true
 
 # --- Recall (message_loop_prompts_after hook) ---
 recall_enabled: true
@@ -30,13 +33,51 @@ validation_min_confidence: 0.3
 validation_require_letter: true
 validation_require_proper_noun: true
 
+# --- Entity Dedup (Phase 1) ---
+dedup_enabled: true
+dedup_similarity_threshold: 0.85
+dedup_use_levenshtein: true
+
+# --- Confidence Decay (Phase 1) ---
+decay_enabled: true
+decay_factor: 0.95
+decay_age_days: 7
+decay_min_interval_hours: 6
+decay_min_confidence_floor: 0.15
+
+# --- Alias Support (Phase 1) ---
+alias_lookup_enabled: true
+alias_max_per_entity: 10
+
+# --- Dreaming Engine (Phase 4) ---
+dreaming_enabled: false
+dreaming_trigger: idle
+dreaming_idle_interval: 50
+dreaming_passes:
+  decay: true
+  dedup: true
+  prune: true
+  infer: true
+  strengthen: true
+  link: false
+  checkpoint: true
+
+# --- Prune Settings ---
+prune_min_confidence: 0.15
+
+# --- Strengthen Settings ---
+strengthen_co_occurrence_threshold: 3
+
+# --- Multi-Agent Sync (Phase 3) ---
+multi_agent_sync_enabled: false
+sync_interval_hours: 24
+sync_shared_dir: /a0/shared/graphs
+sync_agent_name: auto
+
 # --- Write Concurrency ---
 write_semaphore_limit: 2
 
 # --- Rollout Phase ---
-# shadow = extract+recall run, outputs logged not injected
-# read_only = recall feeds context but no prompt injection
-# full = prompt injection enabled
 rollout_phase: full
 
 # --- SQLite ---

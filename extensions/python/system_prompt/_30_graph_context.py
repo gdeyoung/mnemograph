@@ -1,7 +1,6 @@
 """
 Graph context injection hook (system_prompt/_30).
-Regex question detection → entity registry lookup → bounded context injection.
-Max 3 entities, max 10 lines.
+Stopword-filtered keyword extraction + FTS5 entity lookup.
 """
 
 import asyncio
@@ -14,7 +13,6 @@ from agent import LoopData
 
 log = logging.getLogger("_graph_memory.context")
 
-# Regex patterns for detecting questions about entities
 _QUESTION_PATTERNS = [
     re.compile(r"\bwhat\b.*\b(is|are|was|were)\b", re.IGNORECASE),
     re.compile(r"\bwho\b.*\b(is|are|was|were)\b", re.IGNORECASE),
@@ -26,7 +24,6 @@ _QUESTION_PATTERNS = [
     re.compile(r"\bdifference between\b", re.IGNORECASE),
 ]
 
-# Skip injection for very short or code-heavy messages
 _CODE_PATTERN = re.compile(r"```|def |class |import |from ", re.MULTILINE)
 
 
@@ -37,27 +34,6 @@ def _is_question(text: str) -> bool:
         if pat.search(text):
             return True
     return False
-
-
-def _extract_keywords(text: str, max_kw: int = 5) -> list[str]:
-    """Extract potential entity keywords from text."""
-    # Simple keyword extraction: capitalized words and known tech terms
-    words = text.split()
-    keywords = []
-    seen = set()
-    for w in words:
-        clean = re.sub(r"[^a-zA-Z0-9_-]", "", w)
-        if not clean or len(clean) < 2:
-            continue
-        if clean.lower() in seen:
-            continue
-        # Capitalized or known pattern
-        if clean[0].isupper() or clean.isupper():
-            keywords.append(clean)
-            seen.add(clean.lower())
-        if len(keywords) >= max_kw:
-            break
-    return keywords
 
 
 class GraphContext(Extension):
@@ -74,7 +50,6 @@ class GraphContext(Extension):
         if rollout in ("shadow", "read_only"):
             return
 
-        # Get user message
         user_msg = ""
         if loop_data.user_message:
             try:
@@ -84,11 +59,9 @@ class GraphContext(Extension):
         if not user_msg:
             return
 
-        # Skip code-heavy messages
         if _CODE_PATTERN.search(user_msg):
             return
 
-        # Only inject for questions
         if not _is_question(user_msg):
             return
 
@@ -97,12 +70,12 @@ class GraphContext(Extension):
 
         try:
             from usr.plugins._graph_memory.helpers import entity_registry
+            from usr.plugins._graph_memory.helpers.stopwords import extract_keywords
 
-            keywords = _extract_keywords(user_msg, max_kw=5)
+            keywords = extract_keywords(user_msg, max_kw=5)
             if not keywords:
                 return
 
-            # Search for entities matching keywords
             found_entities = []
             seen_ids = set()
             for kw in keywords:
@@ -110,7 +83,7 @@ class GraphContext(Extension):
                     break
                 results = await asyncio.wait_for(
                     entity_registry.search(kw, limit=max_entities),
-                    timeout=0.01,  # 10ms budget
+                    timeout=0.01,
                 )
                 for ent in results:
                     if ent["entity_id"] not in seen_ids:
@@ -122,7 +95,6 @@ class GraphContext(Extension):
             if not found_entities:
                 return
 
-            # Build bounded context block
             lines = ["## Knowledge Graph Context"]
             for ent in found_entities[:max_entities]:
                 desc = ent.get("description", "")

@@ -1,5 +1,5 @@
 """
-SQLite operations for _graph_memory plugin.
+SQLite operations for graph_memory plugin.
 Thread-local connections, schema management, and CRUD.
 All sync operations are designed to be called via asyncio.to_thread().
 """
@@ -9,6 +9,7 @@ import threading
 import uuid
 import importlib.util
 import os
+import json
 from datetime import datetime, timezone
 
 _local = threading.local()
@@ -16,7 +17,6 @@ _write_semaphore = None
 
 
 def _get_write_semaphore():
-    """Lazily initialize the write semaphore (needs event loop)."""
     global _write_semaphore
     if _write_semaphore is None:
         import asyncio
@@ -25,15 +25,12 @@ def _get_write_semaphore():
 
 
 def _get_db_path() -> str:
-    """Return path to plugin's own SQLite database."""
-    import os
     data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     os.makedirs(data_dir, exist_ok=True)
     return os.path.join(data_dir, "graph.db")
 
 
 def get_connection() -> sqlite3.Connection:
-    """Thread-local connection with WAL mode and hardening."""
     if not hasattr(_local, "conn") or _local.conn is None:
         path = _get_db_path()
         conn = sqlite3.connect(path, check_same_thread=False)
@@ -47,7 +44,6 @@ def get_connection() -> sqlite3.Connection:
 
 
 def close_connection():
-    """Close thread-local connection."""
     if hasattr(_local, "conn") and _local.conn is not None:
         _local.conn.close()
         _local.conn = None
@@ -60,7 +56,6 @@ def _now_iso() -> str:
 # ─── Schema Management ───────────────────────────────────────
 
 def get_schema_version() -> int:
-    """Return current schema version, 0 if not initialized."""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -72,7 +67,6 @@ def get_schema_version() -> int:
 
 
 def run_migrations():
-    """Apply pending migrations from graph_migrations/ directory."""
     conn = get_connection()
     current = get_schema_version()
 
@@ -102,7 +96,7 @@ def run_migrations():
             continue
 
         spec = importlib.util.spec_from_file_location(
-            f"_graph_memory.migrations.{mod_name}",
+            f"graph_memory.migrations.{mod_name}",
             os.path.join(migrations_dir, fname),
         )
         if not spec or not spec.loader:
@@ -126,9 +120,7 @@ def run_migrations():
 
 
 def ensure_schema():
-    """Create tables if needed and run migrations. Safe to call repeatedly."""
     conn = get_connection()
-    # Create schema_meta first so get_schema_version works
     conn.execute(
         "CREATE TABLE IF NOT EXISTS graph_schema_meta ("
         "  version INTEGER PRIMARY KEY,"
@@ -145,14 +137,13 @@ def ensure_schema():
 # ─── Entity CRUD ─────────────────────────────────────────────
 
 def upsert_entity(name, etype, domain, description="", aliases=None,
-                   session_id=None, confidence=0.5):
+                   session_id=None, confidence=0.5, canonical_name=None):
     """Insert or update an entity. Returns entity_id."""
     conn = get_connection()
     now = _now_iso()
     eid = uuid.uuid4().hex[:16]
     aliases_json = "[]"
     if aliases:
-        import json
         aliases_json = json.dumps(aliases)
 
     cur = conn.execute(
@@ -171,20 +162,52 @@ def upsert_entity(name, etype, domain, description="", aliases=None,
         conn.commit()
         return existing["entity_id"]
 
+    # Compute canonical_name if not provided
+    if not canonical_name:
+        canonical_name = _compute_canonical_name(name)
+
+    # Try FTS5 search for canonical_name match (dedup)
+    try:
+        existing_canon = conn.execute(
+            "SELECT entity_id FROM graph_entities WHERE canonical_name = ? LIMIT 1",
+            (canonical_name,)
+        ).fetchone()
+        if existing_canon:
+            # Merge into existing entity
+            conn.execute(
+                "UPDATE graph_entities SET mention_count = mention_count + 1, "
+                "last_seen = ?, confidence = MAX(confidence, ?) "
+                "WHERE entity_id = ?",
+                (now, confidence, existing_canon["entity_id"])
+            )
+            conn.commit()
+            return existing_canon["entity_id"]
+    except sqlite3.OperationalError:
+        pass  # canonical_name column may not exist yet (pre-migration)
+
     conn.execute(
         "INSERT INTO graph_entities "
         "(entity_id, name, type, domain, confidence, mention_count, "
-        " first_seen, last_seen, description, aliases, session_id) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        " first_seen, last_seen, description, aliases, session_id, canonical_name) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
         (eid, name, etype, domain, confidence, now, now, description,
-         aliases_json, session_id),
+         aliases_json, session_id, canonical_name),
     )
     conn.commit()
     return eid
 
 
+def _compute_canonical_name(name: str) -> str:
+    """Lowercase, strip suffixes, collapse whitespace."""
+    import re
+    s = name.lower().strip()
+    s = re.sub(r'\b(inc|corp|corporation|ltd|limited|the)\.?', '', s)
+    s = re.sub(r'[^a-z0-9 ]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
 def get_entity_by_name(name):
-    """Fetch single entity by exact name."""
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM graph_entities WHERE name = ?", (name,)
@@ -200,9 +223,43 @@ def get_entity_by_id(entity_id):
     return dict(row) if row else None
 
 
-def search_entities(query, limit=10, domain=None, etype=None):
-    """Search entities by name/description LIKE."""
+def search_teams(query, limit=10, domain=None, etype=None):
+    """Search entities — FTS5 first, LIKE fallback."""
     conn = get_connection()
+    # Try FTS5
+    try:
+        fts_query = _build_fts_query(query)
+        sql = (
+            "SELECT e.* FROM graph_entities e "
+            "JOIN graph_entities_fts f ON e.rowid = f.rowid "
+            "WHERE graph_entities_fts MATCH ? "
+        )
+        params = [fts_query]
+        if domain:
+            sql += "AND e.domain = ? "
+            params.append(domain)
+        if etype:
+            sql += "AND e.type = ? "
+            params.append(etype)
+        sql += "ORDER BY rank, e.mention_count DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        if rows:
+            return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        pass
+    # LIKE fallback
+    return _search_like(query, limit, domain, etype)
+
+
+def _build_fts_query(query: str) -> str:
+    import re
+    words = re.findall(r'\w+', query.lower())
+    return ' OR '.join(f'{w}*' for w in words[:5])
+
+
+def _search_like(query, limit=10, domain=None, etype=None):
+    """Fallback LIKE search."""
     sql = (
         "SELECT * FROM graph_entities "
         "WHERE (name LIKE ? OR description LIKE ?) "
@@ -220,8 +277,12 @@ def search_entities(query, limit=10, domain=None, etype=None):
     return [dict(r) for r in rows]
 
 
+# Keep old name as alias
+search_teams = search_teams
+search = search_teams
+
+
 def get_top_entities(limit=10, domain=None):
-    """Get top entities by confidence × mention_count."""
     conn = get_connection()
     sql = (
         "SELECT * FROM graph_entities "
@@ -238,7 +299,6 @@ def get_top_entities(limit=10, domain=None):
 
 
 def update_entity_confidence(entity_ids, factor):
-    """Apply decay: confidence = MAX(0.1, confidence * factor)."""
     if not entity_ids:
         return 0
     conn = get_connection()
@@ -253,7 +313,6 @@ def update_entity_confidence(entity_ids, factor):
 
 
 def delete_entity(entity_id):
-    """Delete entity and its relationships/memory_links."""
     conn = get_connection()
     entity = get_entity_by_id(entity_id)
     if not entity:
@@ -276,7 +335,6 @@ def delete_entity(entity_id):
 
 def upsert_relationship(source_name, target_name, rel_type,
                          confidence=0.5, source_doc=""):
-    """Insert or update a relationship (idempotent via UNIQUE constraint)."""
     conn = get_connection()
     now = _now_iso()
     conn.execute(
@@ -291,7 +349,6 @@ def upsert_relationship(source_name, target_name, rel_type,
 
 
 def get_relationships_for_entity(name, limit=20):
-    """Get all relationships where entity is source or target."""
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM graph_relationships "
@@ -332,6 +389,38 @@ def get_memory_ids_for_entity(entity_id):
     return [r["memory_id"] for r in rows]
 
 
+# ─── Session State (Phase 5.1) ───────────────────────────────
+
+def get_session_state(session_id):
+    """Get extraction state for a session."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM graph_session_state WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def update_session_state(session_id, msg_index):
+    """Update session extraction state."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_session_state "
+            "(session_id, last_extracted_msg_index, last_extraction_at, total_extractions) "
+            "VALUES (?, ?, ?, "
+            "  COALESCE((SELECT total_extractions FROM graph_session_state WHERE session_id = ?), 0) + 1"
+            ")",
+            (session_id, msg_index, _now_iso(), session_id)
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet
+
+
 # ─── Stats ───────────────────────────────────────────────────
 
 def get_stats():
@@ -364,7 +453,6 @@ def get_stats():
 
 
 def get_all_entities(limit=10000):
-    """Fetch all entities (for export)."""
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM graph_entities ORDER BY created_at ASC LIMIT ?",

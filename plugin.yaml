@@ -1,10 +1,10 @@
 name: graph_memory
 title: Graph Memory
 description: >
-  In-process knowledge graph layer — entity extraction, relationship tracking,
-  recall enrichment, and backup/restore lifecycle. Orthogonal to Memex
-  (tracks WHAT the user knows, not WHO the user is).
-version: 1.0.0
+  In-process knowledge graph layer with dreaming engine — entity extraction, relationship
+  tracking, recall enrichment, fuzzy dedup, confidence decay, transitive inference,
+  and multi-agent sync. Zero external databases.
+version: 2.0.0
 always_enabled: true
 settings_sections:
   - agent

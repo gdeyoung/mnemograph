@@ -1,7 +1,7 @@
 """
 Graph entity extraction hook (monologue_end/_55).
 Bounded asyncio.Queue with dedicated worker + circuit breaker.
-Runs BEFORE Memex hooks (_60+).
+Session-aware re-extraction optimization + decay/dreaming triggers.
 """
 
 import asyncio
@@ -15,11 +15,11 @@ from agent import LoopData
 
 log = logging.getLogger("_graph_memory.extract")
 
-# Module-level bounded queue + worker state
 _extraction_queue: asyncio.Queue | None = None
 _worker_started = False
 _consecutive_failures = 0
 _circuit_open_until = 0.0
+_extraction_count = 0
 
 
 def _get_queue(maxsize: int = 50) -> asyncio.Queue:
@@ -37,13 +37,11 @@ def _ensure_worker():
 
 
 async def _extraction_worker():
-    """Dedicated worker coroutine processing extraction tasks."""
-    global _consecutive_failures, _circuit_open_until
+    global _consecutive_failures, _circuit_open_until, _extraction_count
     queue = _get_queue()
     while True:
         task = await queue.get()
         try:
-            # Circuit breaker check
             if time.monotonic() < _circuit_open_until:
                 log.warning("Graph extraction circuit breaker open, skipping")
                 queue.task_done()
@@ -51,11 +49,33 @@ async def _extraction_worker():
 
             await _process_extraction(task)
             _consecutive_failures = 0
+            _extraction_count += 1
+
+            # Trigger decay check periodically
+            config = task.get("config", {})
+            if config.get("decay_enabled", True):
+                try:
+                    from usr.plugins._graph_memory.helpers import decay_scheduler
+                    await decay_scheduler.run_if_due(config)
+                except Exception as e:
+                    log.debug(f"Decay scheduler skip: {e}")
+
+            # Trigger dreaming cycle periodically
+            dream_interval = config.get("dreaming_idle_interval", 50)
+            if (config.get("dreaming_enabled", False) and
+                    _extraction_count % dream_interval == 0):
+                try:
+                    from usr.plugins._graph_memory.helpers.dreaming import run_dream_cycle
+                    log.info("Triggering dreaming cycle (idle interval reached)")
+                    asyncio.create_task(run_dream_cycle(config))
+                except Exception as e:
+                    log.debug(f"Dreaming trigger skip: {e}")
+
         except Exception as e:
             _consecutive_failures += 1
             log.error(f"Graph extraction failed: {e}")
             if _consecutive_failures >= 3:
-                _circuit_open_until = time.monotonic() + 300  # 5 min
+                _circuit_open_until = time.monotonic() + 300
                 log.error("Graph extraction circuit breaker tripped (3 failures)")
                 _consecutive_failures = 0
         finally:
@@ -63,7 +83,6 @@ async def _extraction_worker():
 
 
 async def _process_extraction(task: dict):
-    """Process a single extraction task."""
     agent = task.get("agent")
     conversation_text = task.get("conversation_text", "")
     session_id = task.get("session_id", "")
@@ -74,7 +93,6 @@ async def _process_extraction(task: dict):
     from usr.plugins._graph_memory.helpers.graph_extractor import extract_and_store
     from usr.plugins._graph_memory.helpers import graph_lifecycle
 
-    # Ensure schema exists
     await graph_lifecycle.run_schema_migrations()
 
     result = await extract_and_store(agent, conversation_text, session_id)
@@ -104,8 +122,26 @@ class GraphExtract(Extension):
         if len(msgs) < min_msgs:
             return
 
-        # Build conversation text from recent messages
-        recent = msgs[-15:]  # last 15 messages max
+        session_id = self.agent.context.id if self.agent.context else ""
+        msg_count = len(msgs)
+
+        # Session-aware re-extraction optimization (Rec #8)
+        from usr.plugins._graph_memory.helpers import graph_db
+        state = await asyncio.to_thread(graph_db.get_session_state, session_id)
+        last_idx = state.get("last_extracted_msg_index", 0) if state else 0
+
+        if config.get("session_aware_extraction", True) and last_idx >= msg_count:
+            return  # Already extracted everything
+
+        # Only extract from new messages if session-aware
+        if config.get("session_aware_extraction", True) and last_idx > 0:
+            new_msgs = msgs[last_idx:]
+            if len(new_msgs) < 3:
+                return  # Not enough new content
+            recent = new_msgs[-15:]
+        else:
+            recent = msgs[-15:]
+
         lines = []
         for m in recent:
             try:
@@ -119,7 +155,8 @@ class GraphExtract(Extension):
         if len(conversation_text) < 50:
             return
 
-        session_id = self.agent.context.id if self.agent.context else ""
+        # Update session state
+        await asyncio.to_thread(graph_db.update_session_state, session_id, msg_count)
 
         # Enqueue extraction task
         queue_maxsize = config.get("extraction_queue_maxsize", 50)
@@ -128,14 +165,13 @@ class GraphExtract(Extension):
         _ensure_worker()
 
         try:
-            # Use put_nowait to avoid blocking; drop oldest if full
             queue.put_nowait({
                 "agent": self.agent,
                 "conversation_text": conversation_text,
                 "session_id": session_id,
+                "config": config,
             })
         except asyncio.QueueFull:
-            # Drop oldest task
             try:
                 queue.get_nowait()
                 queue.task_done()
@@ -144,6 +180,7 @@ class GraphExtract(Extension):
                     "agent": self.agent,
                     "conversation_text": conversation_text,
                     "session_id": session_id,
+                    "config": config,
                 })
             except Exception:
                 log.error("Failed to enqueue extraction task after dropping oldest")

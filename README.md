@@ -523,3 +523,71 @@ MIT License — see [LICENSE](LICENSE).
 **Mnemograph** — *The memory layer that thinks in connections.*
 
 </div>
+
+---
+
+## 🌙 v2.0.0 — Dreaming Engine & Quality Improvements
+
+### What's New
+
+| Feature | Description |
+|---------|-------------|
+| **Dreaming Engine** | 7-pass background consolidation: decay → dedup → prune → infer → strengthen → link → checkpoint |
+| **FTS5 Search** | Full-text search replacing LIKE queries, with automatic fallback |
+| **Entity Dedup** | Canonical name computation + fuzzy merge (threshold 0.85) |
+| **Confidence Decay** | Stale entities (7+ days unseen) get confidence *= 0.95 |
+| **Transitive Inference** | 2-hop relationship inference for depends_on/part_of/runs_on |
+| **Multi-Agent Sync** | Export/merge graphs across agents via shared drive |
+| **Session-Aware Extraction** | Tracks processed messages per session (>70% fewer LLM calls) |
+| **Stopword Filtering** | Recall keyword extraction filters ~80 common stopwords |
+| **Entity Type Validation** | Known entities (Docker, Python) get type-corrected automatically |
+| **Alias Support** | Extractor captures aliases; search checks alias arrays |
+
+### Dreaming Engine
+
+Run a full consolidation cycle manually:
+```python
+graph_memory(action="dream")
+```
+
+Or enable autonomous dreaming:
+```yaml
+dreaming_enabled: true
+dreaming_trigger: idle
+dreaming_idle_interval: 50  # every 50 extractions
+```
+
+**7 Passes:**
+
+| Pass | What It Does |
+|------|-------------|
+| **Decay** | Reduces confidence for entities not seen in 7+ days |
+| **Dedup** | Merges entities with matching canonical names |
+| **Prune** | Removes entities with confidence < 0.15 and single mention |
+| **Infer** | Creates transitive relationships (A→B, B→C ⊢ A→C) |
+| **Strengthen** | Boosts confidence for entities that co-occur in sessions |
+| **Link** | Populates FAISS memory links (stub) |
+| **Checkpoint** | WAL flush + VACUUM |
+
+### Multi-Agent Sync
+
+```python
+# Export this agent's graph to shared drive
+graph_memory(action="sync_export")
+
+# Import/merge global graph from shared drive
+graph_memory(action="sync_import")
+
+# Check sync state
+graph_memory(action="sync_status")
+```
+
+### Migration 002
+
+Automatic on startup. Adds:
+- FTS5 virtual table + sync triggers
+- `graph_session_state` table
+- `canonical_name` column on entities
+- `graph_entity_embeddings` sidecar table
+
+Non-destructive — all existing data preserved.
